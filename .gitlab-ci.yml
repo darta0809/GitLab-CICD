@@ -1,0 +1,202 @@
+image: docker:20.10.12-alpine3.15
+
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+  MAVEN_CLI_OPTS: "-U --batch-mode --errors --fail-at-end --show-version -DinstallAtEnd=true -DdeployAtEnd=true"
+  IMAGE_NAME: test-project
+  CI_IMAGE: $CI_REGISTRY_IMAGE/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA
+  HOST_NAME: gcr.io
+  DEPLOY_IMAGE: $HOST_NAME/$PROJECT_ID/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA
+  KUBERNETES_DIR: "./k8s"
+  DEPLOY_FILE_NAME: "deployment.yml"
+
+# 啟動 cache 讓整個分支共用一個 cache 減少下載 dependency 的時間
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - .m2/repository
+
+# 引用 GitLab CI/CD 加值服務，很簡單，只要 include 就可以了！
+# include:
+  # - template: Code-Quality.gitlab-ci.yml
+  # - template: SAST.gitlab-ci.yml
+  # - template: Dependency-Scanning.gitlab-ci.yml
+  # - template: License-Scanning.gitlab-ci.yml
+
+stages:
+  - compile
+  - format validation
+  - test
+  - package
+  - deploy-container
+  - publish
+  - deploy
+  #  - quality
+  # - deploy
+  # - build Docker image
+
+compile check:
+  stage: compile
+  tags:
+    - COMPILE
+  image: maven:3.8.4-openjdk-17
+  script:
+    - cp ci_settings.xml /root/.m2/settings.xml
+    - mvn $MAVEN_CLI_OPTS clean compile test-compile
+  except:
+    - schedules
+    - tags
+  interruptible: true
+
+format code:
+  stage: format validation
+  tags:
+    - COMPILE
+  image: maven:3.8.4-openjdk-17
+  script:
+    - mvn $MAVEN_CLI_OPTS clean compile
+  #    - '[ ! -z "$(git status -s)" ] && exit 1 || echo "Good to go!"'
+  except:
+    - schedules
+    - tags
+  interruptible: true
+
+testing:
+  stage: test
+  tags:
+    - COMPILE
+  image: maven:3.8.4-openjdk-17
+  artifacts:
+    paths:
+      - target/site/jacoco/
+    reports:
+      junit:
+        - target/surefire-reports/TEST-*.xml
+        - target/failsafe-reports/TEST-*.xml
+  script:
+    - mvn $MAVEN_CLI_OPTS clean test jacoco:report
+    - mvn $MAVEN_CLI_OPTS clean test
+  #    - cat target/site/jacoco/index.html | grep -o 'Total[^%]*%'
+  except:
+    - schedules
+    - tags
+  interruptible: true
+  coverage: '/Total.*?([0-9]{1,3})%/'
+
+#code_quality:
+#  stage: quality
+#  tags:
+#    - COMPILE
+  # 不使用 cache 的原因是發現，CQ 的服務會連同相依函式庫都拿來檢查
+#  cache: { }
+  # 如果不需要讓 CQ 報告可以下載，這裡可以去掉
+#  variables:
+#    REPORT_FORMAT: html
+#  artifacts:
+#    paths:
+#      - gl-code-quality-report.html
+#    reports:
+#      codequality:
+#        - gl-code-quality-report.html
+#  interruptible: true
+
+# 覆寫 SAST 定義，階段設定為 quality，Java 版本採用 17 版
+#sast:
+#  stage: quality
+#  tags:
+#    - COMPILE
+#  variables:
+#    SAST_JAVA_VERSION: "17"
+#  artifacts:
+#    paths:
+#      - gl-sast-report.json
+#    reports:
+#      sast: gl-sast-report.json
+#  interruptible: true
+
+# 覆寫 DS 定義，階段設定為 quality
+#dependency_scanning:
+#  stage: quality
+#  tags:
+#    - COMPILE
+#  artifacts:
+#    paths:
+#      - gl-dependency_scanning-report.json
+#    reports:
+#      dependency_scanning: gl-dependency_scanning-report.json
+
+# 覆寫 LS 定義，階段設定為 quality，Java 版本採用 17 版
+#license_scanning:
+#  stage: quality
+#  tags:
+#    - COMPILE
+#  variables:
+#    LM_JAVA_VERSION: "17"
+#  artifacts:
+#    paths:
+#      - gl-license_scanning-report.json
+#    reports:
+#      license_scanning: gl-license_scanning-report.json
+
+package:
+  stage: package
+  tags:
+    - COMPILE
+  image: maven:3.8.4-openjdk-17
+  artifacts:
+    paths:
+      - target/*.jar
+  script:
+    - mvn $MAVEN_CLI_OPTS clean package -DskipTests
+  except:
+    - schedules
+    - tags
+  interruptible: true
+
+#deploy:
+#  stage: deploy
+#  tags:
+#    - COMPILE
+#  image: maven:3.8.4-openjdk-17
+#  script:
+#    - mvn $MAVEN_CLI_OPTS -DskipTests deploy -s ci_settings.xml
+
+# gitlab container registries
+deploy-container:
+  stage: deploy-container
+  tags:
+    - COMPILE
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $CI_IMAGE .
+    - docker push $CI_IMAGE
+  except:
+    - schedules
+    - tags
+  interruptible: true
+
+# GCR
+publish:
+  stage: publish
+  tags:
+    - COMPILE
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - cat $GCP_KEY | docker login -u _json_key --password-stdin https://$HOST_NAME
+  script:
+    - docker pull $CI_IMAGE
+    - docker tag $CI_IMAGE $DEPLOY_IMAGE
+    - docker push $DEPLOY_IMAGE
+
+# GKE
+gke-deploy:
+  image: google/cloud-sdk
+  stage: deploy
+  tags:
+    - COMPILE
+  before_script:
+    - gcloud auth activate-service-account --key-file $GCP_KEY --project=$GCP_PROJECT_ID
+    - gcloud container clusters get-credentials $GCP_CLUSTER_NAME --zone $GCP_ZONE --project $GCP_PROJECT_ID
+  script:
+    - kubectl apply -f $DEPLOY_FILE_NAME
